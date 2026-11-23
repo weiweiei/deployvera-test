@@ -3,6 +3,11 @@ const net = require('net');
 const tls = require('tls');
 const port = process.env.PORT || 3000;
 
+// A stray error must never kill the checker: log it and keep serving.
+process.on('uncaughtException', (e) => {
+  console.error('uncaughtException (kept alive):', (e && e.stack) || e);
+});
+
 const HOSTING_WORDS = ['hosting', 'vpn', 'datacenter', 'data center',
   'colocation', 'colo', 'cloud', 'amazon', 'digitalocean', 'ovh', 'hetzner',
   'linode', 'vultr', 'contabo', 'm247', 'choopa', 'leaseweb', '3xk',
@@ -135,6 +140,21 @@ async function checkProxy(proxyUrl) {
   return result;
 }
 
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+function safeJson(res, code, obj) {
+  try {
+    if (res.writableEnded) return;
+    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(obj, null, 2));
+  } catch (e) { /* client already gone */ }
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.url === '/ip') {
     try {
@@ -156,22 +176,21 @@ const server = http.createServer(async (req, res) => {
       if (raw.length > 4096) req.destroy();
     });
     req.on('end', async () => {
+      res.on('error', () => {});
       try {
         const body = JSON.parse(raw || '{}');
         const u = new URL(body.url || '');
         if (u.protocol !== 'https:' || !u.hostname.endsWith('.bringyour.com')) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'only https://*.bringyour.com proxy URLs' }));
+          safeJson(res, 400, { error: 'only https://*.bringyour.com proxy URLs' });
           return;
         }
         console.log('check', maskUrl(body.url));
-        const result = await checkProxy(body.url);
+        const result = await withTimeout(checkProxy(body.url), 75000, 'check timed out');
         console.log('check done', maskUrl(body.url), result.ip, result.pass);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result, null, 2));
+        safeJson(res, 200, result);
       } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+        console.log('check error', String((e && e.message) || e));
+        safeJson(res, 500, { error: String((e && e.message) || e) });
       }
     });
     return;
